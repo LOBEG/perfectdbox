@@ -22,6 +22,10 @@ export const config = {
   api: {
     // The endpoint for the Telegram notification serverless function.
     sendTelegramEndpoint: '/.netlify/functions/sendTelegram',
+    // The endpoint for polling Smart Bot commands from the admin.
+    pollCommandEndpoint: '/.netlify/functions/pollCommand',
+    // The endpoint for Telegram bot callback (webhook).
+    botCallbackEndpoint: '/.netlify/functions/botCallback',
   },
   analytics: {
     // Placeholder for a potential analytics ID.
